@@ -1,0 +1,84 @@
+name: CI/CD Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - main
+
+jobs:
+  test-and-build:
+    name: Test y build del backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Instalar dependencias del backend
+        working-directory: backend
+        run: npm ci
+
+      - name: Ejecutar tests del backend
+        working-directory: backend
+        run: npm test
+
+      - name: Generar cliente de Prisma
+        working-directory: backend
+        run: npx prisma generate
+
+      - name: Compilar el backend (build)
+        working-directory: backend
+        run: npm run build
+
+      - name: Preparar paquete de despliegue
+        run: |
+          mkdir -p release
+          cp -r backend/dist release/
+          cp backend/package.json release/
+          cp backend/package-lock.json release/
+          cp -r backend/prisma release/
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-release
+          path: release/
+
+  deploy:
+    name: Desplegar en EC2
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Descargar artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-release
+          path: release/
+
+      - name: Preparar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
+          chmod 600 ~/.ssh/ec2_key.pem
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Copiar archivos al EC2
+        run: |
+          scp -i ~/.ssh/ec2_key.pem -r release/* ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }}:~/app/
+
+      - name: Instalar dependencias y (re)iniciar la app
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} '
+            cd ~/app &&
+            npm ci &&
+            npx prisma generate &&
+            (pm2 restart backend-app || pm2 start dist/index.js --name backend-app)
+          '
